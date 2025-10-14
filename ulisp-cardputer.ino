@@ -1,5 +1,5 @@
-/* uLisp Cardputer Release 4.7d - www.ulisp.com
-   David Johnson-Davies - www.technoblogy.com - 28th April 2025
+/* uLisp Cardputer Release 4.8f - www.ulisp.com
+   David Johnson-Davies - www.technoblogy.com - 14th October 2025
 
    Licensed under the MIT license: https://opensource.org/licenses/MIT
 */
@@ -45,7 +45,7 @@ const char LispLibrary[] = "";
 #define BUFFERSIZE 36  // Number of bits+4
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-  #define WORKSPACESIZE 23750          /* Cells (8*bytes) */
+  #define WORKSPACESIZE 22250          /* Cells (8*bytes) */
   #define MAX_STACK 6500
   #define tft M5Cardputer.Display
   #define COLOR_WHITE WHITE
@@ -108,21 +108,11 @@ const char LispLibrary[] = "";
 
 // Constants
 
+#define USERSTREAMS        16
 #define TRACEMAX 3  // Maximum number of traced functions
 enum type { ZZERO=0, SYMBOL=2, CODE=4, NUMBER=6, STREAM=8, CHARACTER=10, FLOAT=12, ARRAY=14, STRING=16, PAIR=18 };  // ARRAY STRING and PAIR must be last
 enum token { UNUSED, BRA, KET, QUO, DOT };
-enum stream { SERIALSTREAM, I2CSTREAM, SPISTREAM, SDSTREAM, WIFISTREAM, STRINGSTREAM, GFXSTREAM };
 enum fntypes_t { OTHER_FORMS, TAIL_FORMS, FUNCTIONS, SPECIAL_FORMS };
-
-// Stream names used by printobject
-const char serialstream[] = "serial";
-const char i2cstream[] = "i2c";
-const char spistream[] = "spi";
-const char sdstream[] = "sd";
-const char wifistream[] = "wifi";
-const char stringstream[] = "string";
-const char gfxstream[] = "gfx";
-const char *const streamname[] = {serialstream, i2cstream, spistream, sdstream, wifistream, stringstream, gfxstream};
 
 // Typedefs
 
@@ -158,8 +148,21 @@ typedef const struct {
   const char *doc;
 } tbl_entry_t;
 
+// Stream typedefs
+
+typedef uint8_t nstream_t;
+
 typedef int (*gfun_t)();
 typedef void (*pfun_t)(char);
+
+typedef pfun_t (*pstream_ptr_t)(uint8_t address);
+typedef gfun_t (*gstream_ptr_t)(uint8_t address);
+
+typedef const struct {
+  const char *streamname;
+  pstream_ptr_t pfunptr;
+  gstream_ptr_t gfunptr;
+} stream_entry_t;
 
 enum builtins: builtin_t { NIL, TEE, NOTHING, OPTIONAL, FEATURES, INITIALELEMENT, ELEMENTTYPE, TEST, COLONA, COLONB,
 COLONC, BIT, AMPREST, LAMBDA, LET, LETSTAR, CLOSURE, PSTAR, HIGHLIGHT, QUOTE, DEFUN, DEFVAR, EQ, CAR,
@@ -200,7 +203,7 @@ void* StackBottom;
 // Flags
 enum flag { PRINTREADABLY, RETURNFLAG, ESCAPE, EXITEDITOR, LIBRARYLOADED, NOESC, NOECHO, MUFFLEERRORS, BACKTRACE };
 typedef uint16_t flags_t;
-volatile flags_t Flags = 1<<PRINTREADABLY; // Set by default
+flags_t Flags = 1<<PRINTREADABLY; // Set by default
 
 // Forward references
 object *tee;
@@ -513,8 +516,8 @@ void gc (object *form, object *env) {
 // Compact image
 
 void movepointer (object *from, object *to) {
-   uintptr_t limit = ((uintptr_t)(from) - (uintptr_t)(Workspace))/sizeof(uintptr_t);
-   for (uintptr_t i=0; i<limit; i++) {
+  uintptr_t limit = ((uintptr_t)(from) - (uintptr_t)(Workspace))/sizeof(object);
+  for (uintptr_t i=0; i<=limit; i++) {
     object *obj = &Workspace[i];
     unsigned int type = (obj->type) & ~MARKBIT;
     if (marked(obj) && (type >= ARRAY || type==ZZERO || (type == SYMBOL && longsymbolp(obj)))) {
@@ -524,7 +527,7 @@ void movepointer (object *from, object *to) {
     }
   }
   // Fix strings and long symbols
-  for (uintptr_t i=0; i<limit; i++) {
+  for (uintptr_t i=0; i<=limit; i++) {
     object *obj = &Workspace[i];
     if (marked(obj)) {
       unsigned int type = (obj->type) & ~MARKBIT;
@@ -582,7 +585,7 @@ char *MakeFilename (object *arg, char *buffer) {
 
 #if defined(sdcardsupport)
 
-void SDBegin() {
+void SDBegin () {
   SD.begin(SD_SPI_CS_PIN, SPI, 25000000);
 }
 
@@ -1411,11 +1414,6 @@ uint8_t nthchar (object *string, int n) {
 }
 
 int gstr () {
-  if (LastChar) {
-    char temp = LastChar;
-    LastChar = 0;
-    return temp;
-  }
   char c = nthchar(GlobalString, GlobalStringIndex++);
   if (c != 0) return c;
   return '\n'; // -1?
@@ -1946,38 +1944,44 @@ void I2Cstop (TwoWire *port, uint8_t read) {
 
 // Streams
 
+enum stream { SERIALSTREAM, I2CSTREAM, SPISTREAM, SDSTREAM, WIFISTREAM, STRINGSTREAM, GFXSTREAM };
+
 // Simplify board differences
-#if defined(ARDUINO_ADAFRUIT_QTPY_ESP32S2)
-#define ULISP_I2C1
+#if defined(ARDUINO_ADAFRUIT_QTPY_ESP32S2) || defined(ARDUINO_ESP32C6_DEV)
+#define ULISP_HOWMANYI2C 2
 #endif
 
-inline int spiread () { return SPI.transfer(0); }
-inline int i2cread () { return I2Cread(&Wire); }
-#if defined(ULISP_I2C1)
-inline int i2c1read () { return I2Cread(&Wire1); }
-#endif
-inline int serial1read () { while (!Serial1.available()) testescape(); return Serial1.read(); }
-#if defined(sdcardsupport)
-File SDpfile, SDgfile;
-inline int SDread () {
-  if (LastChar) {
-    char temp = LastChar;
-    LastChar = 0;
-    return temp;
-  }
-  return SDgfile.read();
-}
-#endif
+#define ULISP_WIFI
 
 WiFiClient client;
 WiFiServer server(80);
 
-inline int WiFiread () {
-  if (LastChar) {
-    char temp = LastChar;
-    LastChar = 0;
-    return temp;
-  }
+void spiwrite (char c) { SPI.transfer(c); }
+void i2cwrite (char c) { I2Cwrite(&Wire, c); }
+#if ULISP_HOWMANYI2C == 2
+void i2c1write (char c) { I2Cwrite(&Wire1, c); }
+#endif
+void serial1write (char c) { Serial1.write(c); }
+void WiFiwrite (char c) { client.write(c); }
+#if defined(sdcardsupport)
+File SDpfile, SDgfile;
+void SDwrite (char c) { SDpfile.write(c); }
+#endif
+#if defined(gfxsupport)
+void gfxwrite (char c) { tft.write(c); }
+#endif
+
+int spiread () { return SPI.transfer(0); }
+int i2cread () { return I2Cread(&Wire); }
+#if ULISP_HOWMANYI2C == 2
+int i2c1read () { return I2Cread(&Wire1); }
+#endif
+int serial1read () { while (!Serial1.available()) testescape(); return Serial1.read(); }
+#if defined(sdcardsupport)
+int SDread () { return SDgfile.read(); }
+#endif
+
+int WiFiread () {
   while (!client.available()) testescape();
   return client.read();
 }
@@ -1992,76 +1996,155 @@ void serialend (int address) {
   else error("port not supported", number(address));
 }
 
-gfun_t gstreamfun (object *args) {
-  int streamtype = SERIALSTREAM;
-  int address = 0;
-  gfun_t gfun = gserial;
-  if (args != NULL) {
-    int stream = isstream(first(args));
-    streamtype = stream>>8; address = stream & 0xFF;
-  }
-  if (streamtype == I2CSTREAM) {
-    if (address < 128) gfun = i2cread;
-    #if defined(ULISP_I2C1)
-    else gfun = i2c1read;
-    #endif
-  } else if (streamtype == SPISTREAM) gfun = spiread;
-  else if (streamtype == SERIALSTREAM) {
-    if (address == 0) gfun = gserial;
-    else if (address == 1) gfun = serial1read;
-  }
-  #if defined(sdcardsupport)
-  else if (streamtype == SDSTREAM) gfun = (gfun_t)SDread;
+// Stream writing functions
+
+pfun_t pfun_i2c (uint8_t address) {
+  pfun_t pfun;
+  if (address < 128) pfun = i2cwrite;
+  #if ULISP_HOWMANYI2C == 2
+  else pfun = i2c1write;
   #endif
-  else if (streamtype == WIFISTREAM) gfun = (gfun_t)WiFiread;
-  else error2("unknown stream type");
+  return pfun;
+}
+
+pfun_t pfun_spi (uint8_t address) {
+  (void) address;
+  return spiwrite;
+}
+
+pfun_t pfun_serial (uint8_t address) {
+  pfun_t pfun = pserial;
+  if (address == 1) pfun = serial1write;
+  return pfun;
+}
+
+pfun_t pfun_string (uint8_t address) {
+  (void) address;
+  return pstr;
+}
+
+pfun_t pfun_sd (uint8_t address) {
+  (void) address;
+  pfun_t pfun = pserial;
+  #if defined(sdcardsupport)
+  pfun = (pfun_t)SDwrite;
+  #endif
+  return pfun;
+}
+
+pfun_t pfun_gfx (uint8_t address) {
+  (void) address;
+  pfun_t pfun = pserial;
+  #if defined(gfxsupport)
+  pfun = (pfun_t)gfxwrite;
+  #endif
+  return pfun;
+}
+
+pfun_t pfun_wifi (uint8_t address) {
+  (void) address; 
+  pfun_t pfun = pserial;
+  #if defined(ULISP_WIFI)
+  pfun = (pfun_t)WiFiwrite;
+  #endif
+  return pfun;
+}
+
+// Stream reading functions
+
+gfun_t gfun_i2c (uint8_t address) {
+  gfun_t gfun;
+  if (address < 128) gfun = i2cread;
+  #if ULISP_HOWMANYI2C == 2
+  else gfun = i2c1read;
+  #endif
   return gfun;
 }
 
-inline void spiwrite (char c) { SPI.transfer(c); }
-inline void i2cwrite (char c) { I2Cwrite(&Wire, c); }
-#if defined(ULISP_I2C1)
-inline void i2c1write (char c) { I2Cwrite(&Wire1, c); }
-#endif
-inline void serial1write (char c) { Serial1.write(c); }
-inline void WiFiwrite (char c) { client.write(c); }
-#if defined(sdcardsupport)
-inline void SDwrite (char c) { SDpfile.write(c); }
-#endif
-#if defined(gfxsupport)
-inline void gfxwrite (char c) { tft.write(c); }
+gfun_t gfun_spi (uint8_t address) {
+  return spiread;
+}
+
+gfun_t gfun_serial (uint8_t address) {
+  gfun_t gfun = gserial;
+  if (address == 1) gfun = serial1read;
+  return gfun;
+}
+
+gfun_t gfun_sd (uint8_t address) {
+  (void) address;
+  gfun_t gfun = gserial;
+  #if defined(sdcardsupport)
+  gfun = (gfun_t)SDread;
+  #endif
+  return gfun;
+}
+
+gfun_t gfun_wifi (uint8_t address) {
+  (void) address; 
+  gfun_t gfun = gserial;
+  #if defined(ULISP_WIFI)
+  gfun = (gfun_t)WiFiread;
+  #endif
+  return gfun;
+}
+
+// Stream names used by printobject
+const char serialstreamname[] = "serial";
+const char i2cstreamname[] = "i2c";
+const char spistreamname[] = "spi";
+const char sdstreamname[] = "sd";
+const char wifistreamname[] = "wifi";
+const char stringstreamname[] = "string";
+const char gfxstreamname[] = "gfx";
+
+// Stream lookup table - needs to be in same order as enum stream
+const stream_entry_t stream_table[] = {
+  { serialstreamname, pfun_serial, gfun_serial },
+  { i2cstreamname, pfun_i2c, gfun_i2c },
+  { spistreamname, pfun_spi, gfun_spi },
+  { sdstreamname, pfun_sd, gfun_sd },
+  { wifistreamname, pfun_wifi, gfun_wifi },
+  { stringstreamname, pfun_string, NULL },
+  { gfxstreamname, pfun_gfx, NULL },
+};
+
+#if !defined(streamextensions)
+// Stream table cross-reference functions
+
+stream_entry_t *streamtables[] = {stream_table, NULL};
+
+const stream_entry_t *streamtable (int n) {
+  return streamtables[n];
+}
 #endif
 
 pfun_t pstreamfun (object *args) {
-  int streamtype = SERIALSTREAM;
+  nstream_t nstream = SERIALSTREAM;
   int address = 0;
   pfun_t pfun = pserial;
   if (args != NULL && first(args) != NULL) {
     int stream = isstream(first(args));
-    streamtype = stream>>8; address = stream & 0xFF;
+    nstream = stream>>8; address = stream & 0xFF;
   }
-  if (streamtype == I2CSTREAM) {
-    if (address < 128) pfun = i2cwrite;
-    #if defined(ULISP_I2C1)
-    else pfun = i2c1write;
-    #endif
-  } else if (streamtype == SPISTREAM) pfun = spiwrite;
-  else if (streamtype == SERIALSTREAM) {
-    if (address == 0) pfun = pserial;
-    else if (address == 1) pfun = serial1write;
-  }
-  else if (streamtype == STRINGSTREAM) {
-    pfun = pstr;
-  }
-  #if defined(sdcardsupport)
-  else if (streamtype == SDSTREAM) pfun = (pfun_t)SDwrite;
-  #endif
-  #if defined(gfxsupport)
-  else if (streamtype == GFXSTREAM) pfun = (pfun_t)gfxwrite;
-  #endif
-  else if (streamtype == WIFISTREAM) pfun = (pfun_t)WiFiwrite;
-  else error2("unknown stream type");
+  bool n = nstream<USERSTREAMS;
+  pstream_ptr_t streamfunction = streamtable(n?0:1)[n?nstream:nstream-USERSTREAMS].pfunptr;
+  pfun = streamfunction(address);
   return pfun;
+}
+
+gfun_t gstreamfun (object *args) {
+  nstream_t nstream = SERIALSTREAM;
+  int address = 0;
+  gfun_t gfun = gserial;
+  if (args != NULL) {
+    int stream = isstream(first(args));
+    nstream = stream>>8; address = stream & 0xFF;
+  }
+  bool n = nstream<USERSTREAMS;
+  gstream_ptr_t streamfunction = streamtable(n?0:1)[n?nstream:nstream-USERSTREAMS].gfunptr;
+  gfun = streamfunction(address);
+  return gfun;
 }
 
 // Check pins
@@ -2810,7 +2893,9 @@ object *fn_keywordp (object *args, object *env) {
   (void) env;
   object *arg = first(args);
   if (!symbolp(arg)) return nil;
-  return (keywordp(arg) || colonp(arg->name)) ? tee : nil;
+  if (colonp(arg->name)) return tee;
+  if (keywordp(arg)) return (number((int)lookupfn(builtin(arg->name))));
+  return nil;
 }
 
 object *fn_setfn (object *args, object *env) {
@@ -2880,7 +2965,7 @@ object *fn_caaar (object *args, object *env) {
 
 object *fn_caadr (object *args, object *env) {
   (void) env;
-  return cxxxr(args, 0b1001);;
+  return cxxxr(args, 0b1001);
 }
 
 object *fn_cadar (object *args, object *env) {
@@ -3472,24 +3557,46 @@ object *fn_ceiling (object *args, object *env) {
   (void) env;
   object *arg = first(args);
   args = cdr(args);
-  if (args != NULL) return number(ceil(checkintfloat(arg) / checkintfloat(first(args))));
-  else return number(ceil(checkintfloat(arg)));
+  if (args != NULL) {
+    object *arg2 = first(args);
+    if (integerp(arg) && integerp(arg2)) {
+      int num = arg->integer, den = arg2->integer, quo = num/den, rem = num-(quo*den);
+      if (((num<0) != (den<0)) || rem==0) return number(quo); else return number(quo+1);
+    } else return number(ceil(checkintfloat(arg) / checkintfloat(first(args))));
+  } else {
+    if (integerp(arg)) return number(arg->integer);
+    else return number(ceil(checkintfloat(arg)));
+  }
 }
 
 object *fn_floor (object *args, object *env) {
   (void) env;
   object *arg = first(args);
   args = cdr(args);
-  if (args != NULL) return number(floor(checkintfloat(arg) / checkintfloat(first(args))));
-  else return number(floor(checkintfloat(arg)));
+  if (args != NULL) {
+    object *arg2 = first(args);
+    if (integerp(arg) && integerp(arg2)) {
+      int num = arg->integer, den = arg2->integer, quo = num/den, rem = num-(quo*den);
+      if (((num<0) == (den<0)) || rem==0) return number(quo); else return number(quo-1);
+    } else return number(floor(checkintfloat(arg) / checkintfloat(first(args))));
+  } else {
+    if (integerp(arg)) return number(arg->integer);
+    else return number(floor(checkintfloat(arg)));
+  }
 }
 
 object *fn_truncate (object *args, object *env) {
   (void) env;
   object *arg = first(args);
   args = cdr(args);
-  if (args != NULL) return number((int)(checkintfloat(arg) / checkintfloat(first(args))));
-  else return number((int)(checkintfloat(arg)));
+  if (args != NULL) {
+    object *arg2 = first(args);
+    if (integerp(arg) && integerp(arg2)) return number(arg->integer / arg2->integer);
+    else return number((int)(checkintfloat(arg) / checkintfloat(first(args))));
+  } else {
+    if (integerp(arg)) return number(arg->integer);
+    else return number((int)(checkintfloat(arg)));
+  }
 }
 
 object *fn_round (object *args, object *env) {
@@ -3698,10 +3805,10 @@ object *fn_search (object *args, object *env) {
 object *fn_readfromstring (object *args, object *env) {
   (void) env;
   object *arg = checkstring(first(args));
+  if (stringlength(arg) == 0) error2("zero length string");
   GlobalString = arg;
   GlobalStringIndex = 0;
-  object *val = read(gstr);
-  LastChar = 0;
+  object *val = readmain(gstr);
   return val;
 }
 
@@ -3820,7 +3927,7 @@ object *fn_break (object *args, object *env) {
 object *fn_read (object *args, object *env) {
   (void) env;
   gfun_t gfun = gstreamfun(args);
-  return read(gfun);
+  return readmain(gfun);
 }
 
 object *fn_prin1 (object *args, object *env) {
@@ -3859,6 +3966,7 @@ object *fn_terpri (object *args, object *env) {
 object *fn_readbyte (object *args, object *env) {
   (void) env;
   gfun_t gfun = gstreamfun(args);
+  if (gfun == gserial) gserial_flush();
   int c = gfun();
   return (c == -1) ? nil : number(c);
 }
@@ -3866,6 +3974,7 @@ object *fn_readbyte (object *args, object *env) {
 object *fn_readline (object *args, object *env) {
   (void) env;
   gfun_t gfun = gstreamfun(args);
+  if (gfun == gserial) gserial_flush();
   return readstring('\n', false, gfun);
 }
 
@@ -4157,7 +4266,7 @@ object *fn_format (object *args, object *env) {
   object *formatstr = checkstring(second(args));
   object *save = NULL;
   args = cddr(args);
-  int len = stringlength(formatstr);
+  uint16_t len = stringlength(formatstr);
   uint16_t n = 0, width = 0, w, bra = 0;
   char pad = ' ';
   bool tilde = false, mute = false, comma = false, quote = false;
@@ -4236,7 +4345,7 @@ object *fn_require (object *args, object *env) {
     globals = cdr(globals);
   }
   GlobalStringIndex = 0;
-  object *line = read(glibrary);
+  object *line = readmain(glibrary);
   while (line != NULL) {
     // Is this the definition we want
     symbol_t fname = first(line)->name;
@@ -4244,7 +4353,7 @@ object *fn_require (object *args, object *env) {
       eval(line, env);
       return tee;
     }
-    line = read(glibrary);
+    line = readmain(glibrary);
   }
   return nil;
 }
@@ -4252,13 +4361,13 @@ object *fn_require (object *args, object *env) {
 object *fn_listlibrary (object *args, object *env) {
   (void) args, (void) env;
   GlobalStringIndex = 0;
-  object *line = read(glibrary);
+  object *line = readmain(glibrary);
   while (line != NULL) {
     builtin_t bname = builtin(first(line)->name);
     if (bname == DEFUN || bname == DEFVAR) {
       printsymbol(second(line), pserial); pserial(' ');
     }
-    line = read(glibrary);
+    line = readmain(glibrary);
   }
   return bsymbol(NOTHING);
 }
@@ -5224,7 +5333,7 @@ const char doc71[] = "(arrayp item)\n"
 const char doc72[] = "(boundp item)\n"
 "Returns t if its argument is a symbol with a value.";
 const char doc73[] = "(keywordp item)\n"
-"Returns t if its argument is a built-in or user-defined keyword.";
+"Returns non-nil if its argument is a built-in or user-defined keyword.";
 const char doc74[] = "(set symbol value [symbol value]*)\n"
 "For each pair of arguments, assigns the value of the second argument to the value of the first argument.";
 const char doc75[] = "(streamp item)\n"
@@ -5402,9 +5511,9 @@ const char doc147[] = "(expt number power)\n"
 "Returns the result as an integer if the arguments are integers and the result will be within range,\n"
 "otherwise a floating-point number.";
 const char doc148[] = "(ceiling number [divisor])\n"
-"Returns ceil(number/divisor). If omitted, divisor is 1.";
+"Returns the integer closest to +infinity for number/divisor. If divisor is omitted it defaults to 1.";
 const char doc149[] = "(floor number [divisor])\n"
-"Returns floor(number/divisor). If omitted, divisor is 1.";
+"Returns the integer closest to -infinity for number/divisor. If divisor is omitted it defaults to 1.";
 const char doc150[] = "(truncate number [divisor])\n"
 "Returns the integer part of number/divisor. If divisor is omitted it defaults to 1.";
 const char doc151[] = "(round number [divisor])\n"
@@ -6077,8 +6186,6 @@ object *eval (object *form, object *env) {
         form = ((fn_ptr_type)lookupfn(name))(args, env);
         TC = 1;
         goto EVAL;
-     
-      case OTHER_FORMS: error(illegalfn, function);
     }
   }
 
@@ -6113,7 +6220,9 @@ object *eval (object *form, object *env) {
     builtin_t bname = builtin(function->name);
     Context = bname;
     checkminmax(bname, nargs);
-    object *result = ((fn_ptr_type)lookupfn(bname))(args, env);
+    intptr_t call = lookupfn(bname);
+    if (call == 0) error(illegalfn, function);
+    object *result = ((fn_ptr_type)call)(args, env);
     unprotect();
     return result;
   }
@@ -6350,7 +6459,10 @@ void plist (object *form, pfun_t pfun) {
 
 void pstream (object *form, pfun_t pfun) {
   pfun('<');
-  pfstring(streamname[(form->integer)>>8], pfun);
+  nstream_t nstream = (form->integer)>>8;
+  bool n = nstream<USERSTREAMS;
+  const char *streamname = streamtable(n?0:1)[n?nstream:nstream-USERSTREAMS].streamname;
+  pfstring(streamname, pfun);
   pfstring("-stream ", pfun);
   pint(form->integer & 0xFF, pfun);
   pfun('>');
@@ -6381,13 +6493,12 @@ void prin1object (object *form, pfun_t pfun) {
 
 const int ScreenWidth = 240, ScreenHeight = 135;
 #if defined(largerfont) // 8x16 font
-const int Leading = 15;
-const int CharWidth = 8;
+const int Leading = 15, CharWidth = 8;
 #else
-const int Leading = 10;
-const int CharWidth = 6;
+const int Leading = 10, CharWidth = 6;
 #endif
 const int Columns = ScreenWidth/CharWidth;
+const int TextWidth = Columns*CharWidth;
 const int Lines = ScreenHeight/Leading;
 const int LastColumn = Columns-1;
 const int LastLine = Lines-1;
@@ -6415,7 +6526,6 @@ void PlotChar (uint8_t ch, uint8_t line, uint8_t column) {
 #endif
 }
 
-// Clears the bottom line and then scrolls the display up by one line
 void ScrollDisplay () {
   tft.fillRect(0, (Lines*Leading)-Leading, ScreenWidth, Leading, BLACK);
   for (uint8_t x = 0; x < Columns; x++) {
@@ -6442,8 +6552,9 @@ void ScrollDisplay () {
 
 const char VT = 11; // Vertical tab
 const char BEEP = 7;
+const char SHIFTRETURN = 26;
+const char KEY_ESC = 27;
 
-// Prints a character to display, with cursor, handling control characters
 void Display (char c) {
   #if defined(gfxsupport)
   static bool displayDisabled = false;
@@ -6507,8 +6618,6 @@ void Display (char c) {
 
 // Keyboard **********************************************************************************
 
-int LastKeyword = 0; // For autocomplete
-
 char decodeKey () {
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
   for (auto i : status.word) { if (status.fn && i == '`') return 27; else return i; }
@@ -6519,22 +6628,27 @@ char decodeKey () {
   return 0;
 }
 
-/*
-  autoComplete - autocompletes the string in the line editor with the next symbol from the table of built-in symbols. 
-*/
+bool reset_autocomplete = false;
+
 void autoComplete () {
-  static int bufIndex = 0, matchLen = 0, i = 0;
+  static int bufIndex = 0, matchLen = 0, LastKeywordLenDif = 0;
+  static unsigned int i = 0;
   int gap = 0;
   
   // Only update what we're matching if we're not already looking through the buffer
-  if (LastKeyword == 0) { 
+  if (reset_autocomplete == true) { 
     i = 0; // Reset the search
+    LastKeywordLenDif = 0;
+    reset_autocomplete = false;
+    bufIndex = WritePtr;
     for (matchLen = 0; matchLen < 32; matchLen++) {
-      int bufLoc = WritePtr - matchLen;
+      int bufLoc = WritePtr - matchLen; //scan the buffer backwards away from the last character written
       if ((KybdBuf[bufLoc] == ' ') || (KybdBuf[bufLoc] == '(') || (KybdBuf[bufLoc] == '\n')) {
-        // Move past those characters because we're not matching on them
-        bufIndex = bufLoc + 1;
-        matchLen--;
+        if (matchLen > 0) { //if the first character is one of those then we don't have to keep looking
+          // if we found these characters then go forward to the previous character
+          bufIndex = bufLoc + 1;
+          matchLen--;
+        }
         break;
       }
       // Do this test here in case the first character in the buffer is one of the characters we test for
@@ -6545,25 +6659,27 @@ void autoComplete () {
     }
   }
 
-  // Erase the previously shown keyword
-  for (int n=0; n<LastKeyword; n++) ProcessKey(8);
+  if (matchLen > 0) {
+    // Erase the previously shown keyword
+    for (int n=0; n<LastKeywordLenDif; n++) ProcessKey(8);
 
-  // Scan the table for keywords that start with the match buffer
-  int entries = tablesize(0) + tablesize(1);
-  while (true) {
-    bool n = i<tablesize(0);
-    const char *k = table(n?0:1)[n?i:i-tablesize(0)].string;
-    i = (i + 1) % entries; // Wrap
-    if (*k == KybdBuf[bufIndex]) {
-      if (strncmp(k, &KybdBuf[bufIndex], matchLen) == 0) {
-        // Skip the letters we're matching because they're already there
-        LastKeyword = strlen(k) - matchLen;
-        while (*(k + matchLen)) ProcessKey(*(k++ + matchLen));
-        return;
+    // Scan the table for keywords that start with the match buffer
+    int entries = tablesize(0) + tablesize(1);
+    while (true) {
+      bool n = i<tablesize(0);
+      const char *k = table(n?0:1)[n?i:i-tablesize(0)].string;
+      i = (i + 1) % entries; // Wrap
+      if (*k == KybdBuf[bufIndex]) {
+        if (strncmp(k, &KybdBuf[bufIndex], matchLen) == 0) {
+          // Skip the letters we're matching because they're already there
+          LastKeywordLenDif = strlen(k) - matchLen;
+          while (*(k + matchLen)) ProcessKey(*(k++ + matchLen));
+          return;
+        }
       }
+      gap++; 
+      if (gap == entries) return; // No keywords with this letter
     }
-    gap++; 
-    if (gap == entries) return; // No keywords with this letter
   }
 }
 
@@ -6577,11 +6693,11 @@ void Highlight (int p, uint8_t invert) {
     Display(9);
   }
 }
-  
+
 void ProcessKey (char c) {
   static int parenthesis = 0;
   static bool string = false;
-  if (c == 27) { setflag(ESCAPE); return; }    // Escape key
+  if (c == KEY_ESC) { setflag(ESCAPE); return; }    // Escape key
   // Undo previous parenthesis highlight
   Highlight(parenthesis, 0);
   parenthesis = 0;
@@ -6598,7 +6714,7 @@ void ProcessKey (char c) {
       Display(0x7F);
       if (WritePtr) c = KybdBuf[WritePtr-1];
     }
-  } else if (c == 26) { // Shift-Enter
+  } else if (c == SHIFTRETURN) {
     for (int i = 0; i < LastWritePtr; i++) Display(KybdBuf[i]);
     WritePtr = LastWritePtr;
   } else if (WritePtr < KybdBufSize) {
@@ -6626,32 +6742,30 @@ void ProcessKey (char c) {
 // Read functions
 
 int glibrary () {
-  if (LastChar) {
-    char temp = LastChar;
-    LastChar = 0;
-    return temp;
-  }
   char c = LispLibrary[GlobalStringIndex++];
   return (c != 0) ? c : -1; // -1?
 }
 
 void loadfromlibrary (object *env) {
   GlobalStringIndex = 0;
-  object *line = read(glibrary);
+  object *line = readmain(glibrary);
   while (line != NULL) {
     protect(line);
     eval(line, env);
     unprotect();
-    line = read(glibrary);
+    line = readmain(glibrary);
   }
 }
 
+void gserial_flush () {
+  #if defined (serialmonitor)
+  Serial.flush();
+  #endif
+  KybdAvailable = 0;
+  WritePtr = 0;
+}
+
 int gserial () {
-  if (LastChar) {
-    char temp = LastChar;
-    LastChar = 0;
-    return temp;
-  }
   #if defined (serialmonitor)
   unsigned long start = millis();
   while (!KybdAvailable) {
@@ -6666,7 +6780,7 @@ int gserial () {
         if (M5Cardputer.Keyboard.isPressed()) {
           char key = decodeKey();
           if (key == '\t') { autoComplete(); } 
-          else if (key) { LastKeyword = 0; ProcessKey(key); }
+          else if (key) { reset_autocomplete = true; ProcessKey(key); }
         }
       }
     }
@@ -6685,7 +6799,7 @@ int gserial () {
       if (M5Cardputer.Keyboard.isPressed()) {
         char key = decodeKey();
         if (key == '\t') { autoComplete(); } 
-        else if (key) { LastKeyword = 0; ProcessKey(key); }
+        else if (key) { reset_autocomplete = true; ProcessKey(key); }
       }
     }
   }
@@ -6849,6 +6963,24 @@ object *readrest (gfun_t gfun) {
   return head;
 }
 
+gfun_t GFun;
+
+int glast () {
+  if (LastChar) {
+    char temp = LastChar;
+    LastChar = 0;
+    return temp;
+  }
+  return GFun();
+}
+
+object *readmain (gfun_t gfun) {
+  GFun = gfun;
+  if (LastChar) { LastChar = 0; error2("read can only be used with one stream at a time"); }
+  LastChar = 0;
+  return read(glast);
+}
+
 object *read (gfun_t gfun) {
   object *item = nextitem(gfun);
   if (item == (object *)KET) error2("incomplete list");
@@ -6891,7 +7023,7 @@ void setup () {
   initsleep();
   initBoard();
   initgfx();
-  pfstring(PSTR("uLisp 4.7d "), pserial); pln(pserial);
+  pfstring(PSTR("uLisp 4.8f "), pserial); pln(pserial);
 }
 
 // Read/Evaluate/Print loop
@@ -6909,7 +7041,7 @@ void repl (object *env) {
     }
     pserial('>'); pserial(' ');
     Context = NIL;
-    object *line = read(gserial);
+    object *line = readmain(gserial);
     // Break handling
     if (BreakLevel) {
       if (line == nil || line == bsymbol(COLONC)) {
